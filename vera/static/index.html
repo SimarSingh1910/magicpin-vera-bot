@@ -43,6 +43,13 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.primary:hover:not(:disabled) { color: #fff; opacity: .9; }
   .counts { color: var(--muted); font-size: 13px; margin-left: auto; font-variant-numeric: tabular-nums; }
+  button.attention { animation: nudge 2.2s ease-in-out infinite; }
+  @keyframes nudge {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(20,99,86,.42); }
+    50%      { box-shadow: 0 0 0 7px rgba(20,99,86,0); }
+  }
+  @media (prefers-reduced-motion: reduce) { button.attention { animation: none; } }
+  .hint { color: var(--accent); font-size: 13px; margin: 10px 0 0; }
   .note {
     background: var(--warn-soft); color: var(--warn); border: 1px solid transparent;
     padding: 9px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 20px;
@@ -84,7 +91,7 @@
     see here is the real thing, not a mock.</p>
 
   <div class="bar">
-    <button class="primary" id="seed">Load sample data</button>
+    <button class="primary" id="seed">👉 Click here to load sample data</button>
     <button id="reset">Reset state</button>
     <span class="counts" id="counts"></span>
   </div>
@@ -98,9 +105,10 @@
   <div class="panel">
     <h2>1 · Compose — pick an event, see what Vera would send</h2>
     <div class="row">
-      <select id="trigger"><option>Load sample data first</option></select>
+      <select id="trigger"><option>— load the sample data above first —</option></select>
       <button class="primary" id="compose" disabled>Compose</button>
     </div>
+    <p class="hint" id="step1hint">Nothing loaded yet — use the button above to populate the bot.</p>
   </div>
 
   <div class="panel">
@@ -153,8 +161,11 @@ async function refresh() {
   pill.className = "pill" + (ok ? "" : " bad");
   if (ok) {
     const c = data.contexts_loaded || {};
-    $("#counts").textContent =
-      `${c.category||0} categories · ${c.merchant||0} merchants · ${c.customer||0} customers · ${c.trigger||0} triggers`;
+    const total = (c.category||0) + (c.merchant||0) + (c.customer||0) + (c.trigger||0);
+    $("#counts").textContent = total
+      ? `${c.category||0} categories · ${c.merchant||0} merchants · ${c.customer||0} customers · ${c.trigger||0} triggers`
+      : "no context loaded";
+    reflectSeedState(total === 0);
   }
   const meta = await api("/v1/metadata");
   if (meta.ok) $("#team").textContent = "team " + (meta.data.team_name || "");
@@ -165,7 +176,7 @@ async function loadTriggers() {
   const {ok, data} = await api("/demo/catalog");
   const sel = $("#trigger");
   if (!ok || !data.triggers || !data.triggers.length) {
-    sel.innerHTML = "<option>Load sample data first</option>";
+    sel.innerHTML = "<option>— load the sample data above first —</option>";
     setEnabled(false);
     return;
   }
@@ -192,9 +203,20 @@ function addTurn(who, body, metaHtml, rationale) {
 $("#seed").onclick = async e => {
   e.target.disabled = true; e.target.textContent = "Loading…";
   await api("/demo/seed", {});
-  e.target.textContent = "Load sample data"; e.target.disabled = false;
+  e.target.disabled = false;
   await refresh();
 };
+
+// The console is useless until the dataset is in, so the first button says so
+// plainly, keeps a nudge ring while the store is empty, and steps back once
+// there's data — no point shouting after the work is done.
+function reflectSeedState(empty) {
+  const b = $("#seed");
+  b.textContent = empty ? "👉 Click here to load sample data" : "Reload sample data";
+  b.classList.toggle("attention", empty);
+  b.classList.toggle("primary", empty);
+  $("#step1hint").hidden = !empty;
+}
 
 $("#reset").onclick = async () => {
   await api("/v1/teardown", {});
