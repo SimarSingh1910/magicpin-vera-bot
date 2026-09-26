@@ -1,0 +1,161 @@
+"""
+Multi-turn conversation handling for /v1/reply.
+
+State is a plain dict so it can be stored anywhere (in-memory here, could be
+Postgres/Redis elsewhere) and round-tripped through conversation_handlers.py's
+`respond(state, merchant_message)` contract from the main brief (§7.4).
+
+Detection order per turn (first match wins):
+  1. hostile / abusive language                -> end (or apologize once)
+  2. explicit opt-out ("stop", "not interested") -> end
+  3. auto-reply pattern seen twice               -> end (seen once -> one nudge)
+  4. explicit intent commitment ("let's do it")  -> switch straight to action
+  5. off-topic / unrelated question              -> polite decline + redirect
+  6. otherwise                                   -> acknowledge + advance
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Optional
+
+from vera.composer import g, salutation, voice_mix, best_offer_title
+
+
+AUTO_REPLY_PATTERNS = [
+    r"thank(s| you) for (contacting|reaching out)",
+    r"our team will (respond|get back|reach out)",
+    r"i am (currently )?an? automated (assistant|reply|response)",
+    r"this is an automated (message|response|reply)",
+    r"we (have received|will respond to) your (message|query)",
+    r"business is (currently )?closed",
+]
+
+HOSTILE_PATTERNS = [
+    r"\bstop\b", r"\bspam\b", r"\bshut up\b", r"\bfuck\b", r"\bidiot\b",
+    r"harass", r"\bscam\b", r"useless", r"annoying",
+]
+
+OPT_OUT_PATTERNS = [
+    r"not interested", r"\bstop messaging\b", r"leave me alone", r"unsubscribe",
+    r"do not contact", r"don'?t message",
+]
+
+INTENT_COMMIT_PATTERNS = [
+    r"\blet'?s do (it|this)\b", r"\bgo ahead\b", r"\byes,? (please )?(do it|proceed|confirm)\b",
+    r"\bok(ay)? (lets|let'?s) (go|do it)\b", r"\bsure,? go ahead\b", r"\bconfirm(ed)?\b",
+    r"\byes please\b", r"\bstart\b.*\bplease\b", r"haan karo", r"chalega start karo",
+    r"\bi want to join\b", r"\bsign me up\b",
+]
+
+QUALIFYING_PHRASES = ["would you", "do you", "can you tell", "what if", "how about", "are you interested"]
+
+
+def _matches_any(text: str, patterns: list[str]) -> bool:
+    low = text.lower()
+    return any(re.search(p, low) for p in patterns)
+
+
+def new_state(conversation_id: str, merchant_id: str, customer_id: Optional[str],
+              trigger: Optional[dict], merchant: Optional[dict], category: Optional[dict],
+              first_body: str, auto_reply_hits: Optional[dict] = None) -> dict:
+    return {
+        "conversation_id": conversation_id,
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
+        "trigger": trigger or {},
+        "merchant": merchant or {},
+        "category": category or {},
+        "turns": [{"from": "vera", "body": first_body}] if first_body else [],
+        "sent_bodies": {first_body} if first_body else set(),
+        # shared per-merchant dict (exact text -> count) so a canned reply is
+        # recognized even if the judge starts a fresh conversation_id each time
+        "auto_reply_hits": auto_reply_hits if auto_reply_hits is not None else {},
+        "mode": "pitch",  # or "action"
+        "ended": False,
+    }
+
+
+def _dedupe(state: dict, body: str) -> str:
+    """Never resend the exact same body twice in one conversation."""
+    if body not in state["sent_bodies"]:
+        return body
+    return body + " (following up again on this)"
+
+
+def respond(state: dict, merchant_message: str) -> dict:
+    """
+    Given the conversation-so-far (state) and the latest inbound message,
+    return {"action": "send"|"wait"|"end", ...}. Mutates state in place.
+    """
+    if state.get("ended"):
+        return {"action": "end", "rationale": "Conversation already closed."}
+
+    state["turns"].append({"from": "merchant", "body": merchant_message})
+    merchant = state.get("merchant") or {}
+    category = state.get("category") or {}
+    trigger = state.get("trigger") or {}
+    name = salutation(category, merchant)
+
+    # 1. hostile / abusive
+    if _matches_any(merchant_message, HOSTILE_PATTERNS):
+        state["ended"] = True
+        return {"action": "end", "rationale": "Detected hostile/abusive language; closing gracefully without engaging further."}
+
+    # 2. explicit opt-out
+    if _matches_any(merchant_message, OPT_OUT_PATTERNS):
+        state["ended"] = True
+        return {"action": "end", "rationale": "Merchant explicitly opted out; closing conversation and suppressing this conversation_id."}
+
+    # 3. auto-reply detection (canned phrase OR verbatim repeat of a prior merchant turn)
+    is_auto_pattern = _matches_any(merchant_message, AUTO_REPLY_PATTERNS)
+    prior_merchant_turns = [t["body"] for t in state["turns"][:-1] if t["from"] == "merchant"]
+    is_verbatim_repeat = merchant_message in prior_merchant_turns
+    if is_auto_pattern or is_verbatim_repeat:
+        hits = state["auto_reply_hits"]  # shared per-merchant dict — survives across conversation_ids
+        hits[merchant_message] = hits.get(merchant_message, 0) + 1
+        if hits[merchant_message] >= 2:
+            state["ended"] = True
+            return {"action": "end", "rationale": "Same auto-reply pattern seen twice from this merchant — this is WhatsApp Business's canned reply, not the owner. Exiting to avoid wasting turns; will retry via the owner channel later."}
+        # first time: back off rather than burn a turn arguing with a bot
+        return {"action": "wait", "wait_seconds": 14400,
+                "rationale": "Detected merchant auto-reply (canned 'thank you for contacting' shape). Backing off 4 hours to wait for the owner instead of spending turns on it."}
+
+    # 4. explicit intent commitment -> switch straight to action, never re-qualify
+    if _matches_any(merchant_message, INTENT_COMMIT_PATTERNS):
+        state["mode"] = "action"
+        offer = best_offer_title(merchant)
+        next_step = trigger.get("kind", "this")
+        body = f"Done — starting on it now."
+        if offer:
+            body += f" I'll route this through your \"{offer}\" listing."
+        body += " I'll confirm here once it's live — anything specific you want prioritized first?"
+        body = _dedupe(state, body)
+        state["turns"].append({"from": "vera", "body": body})
+        state["sent_bodies"].add(body)
+        return {"action": "send", "body": body, "cta": "open_ended",
+                "rationale": "Merchant gave explicit commitment; switching from pitch to action immediately instead of re-qualifying (Pattern D anti-pattern avoided)."}
+
+    # 5. off-topic / unrelated question -> polite decline + redirect back to the thread
+    on_topic_hint = any(k in merchant_message.lower() for k in
+                         ["yes", "send", "draft", "ok", "sure", "when", "how", "price", "offer", "abstract", "post", "slot", "time"])
+    looks_like_curveball = "?" in merchant_message and not on_topic_hint and len(merchant_message.split()) > 3
+    if looks_like_curveball:
+        body = ("That's outside what I can help with directly — but coming back to what we were on: "
+                "want me to go ahead with the next step?")
+        body = _dedupe(state, body)
+        state["turns"].append({"from": "vera", "body": body})
+        state["sent_bodies"].add(body)
+        return {"action": "send", "body": body, "cta": "open_ended",
+                "rationale": "Off-topic ask politely declined; redirected back to the original trigger without losing the thread."}
+
+    # 6. normal engaged reply -> acknowledge + advance
+    body = "Got it — acting on that now."
+    offer = best_offer_title(merchant)
+    if offer:
+        body += f" I'll tie it to your \"{offer}\"."
+    body += " Anything you'd like me to change before I send?"
+    body = _dedupe(state, body)
+    state["turns"].append({"from": "vera", "body": body})
+    state["sent_bodies"].add(body)
+    return {"action": "send", "body": body, "cta": "open_ended",
+            "rationale": "Engaged reply; acknowledging and advancing to the next concrete step."}

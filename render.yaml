@@ -1,0 +1,17 @@
+# One-click config for Render (render.com). Free tier is enough for the test
+# window, but see the README note about cold starts.
+services:
+  - type: web
+    name: vera-2-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /v1/healthz
+    envVars:
+      - key: TEAM_NAME
+        value: staleCode
+      - key: TEAM_MEMBERS
+        value: Gursimar
+      - key: CONTACT_EMAIL
+        value: gursimar.chauhan@gmail.com
