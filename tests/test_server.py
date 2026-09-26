@@ -160,3 +160,88 @@ def test_suppression_is_a_window_not_a_permanent_ban(monkeypatch):
     monkeypatch.setattr(srv, "SUPPRESSION_TTL_SECONDS", 0.0)
     later = client.post("/v1/tick", json={"now": "x", "available_triggers": [trigger["id"]]}).json()
     assert len(later["actions"]) == 1
+
+
+def test_only_one_action_per_merchant_per_tick():
+    """Two live triggers for one merchant must not produce two messages."""
+    merchant = next(m for m in _load_merchants() if m["merchant_id"] == "m_003_studio11_salon_hyderabad")
+    client.post("/v1/context", json={"scope": "category", "context_id": "salons", "version": 80,
+                                      "payload": _load_category("salons"), "delivered_at": "x"})
+    client.post("/v1/context", json={"scope": "merchant", "context_id": merchant["merchant_id"],
+                                      "version": 80, "payload": merchant, "delivered_at": "x"})
+    ids = []
+    for t in _load_triggers():
+        if t["merchant_id"] == merchant["merchant_id"]:
+            client.post("/v1/context", json={"scope": "trigger", "context_id": t["id"],
+                                              "version": 80, "payload": t, "delivered_at": "x"})
+            ids.append(t["id"])
+    assert len(ids) >= 2, "fixture needs a merchant with 2+ triggers"
+
+    actions = client.post("/v1/tick", json={"now": "2026-04-26T10:00:00Z",
+                                             "available_triggers": ids}).json()["actions"]
+    assert len(actions) == 1, f"{len(actions)} messages to one merchant in one tick"
+    # and it should be the most urgent of the competing triggers
+    urgencies = {t["id"]: t.get("urgency", 0) for t in _load_triggers() if t["id"] in ids}
+    assert urgencies[actions[0]["trigger_id"]] == max(urgencies.values())
+
+
+def test_customer_message_is_withheld_when_consent_does_not_cover_it():
+    """A customer opted in only for recall reminders must not get a win-back promo."""
+    merchant = next(m for m in _load_merchants() if m["merchant_id"] == "m_001_drmeera_dentist_delhi")
+    client.post("/v1/context", json={"scope": "merchant", "context_id": merchant["merchant_id"],
+                                      "version": 70, "payload": merchant, "delivered_at": "x"})
+    client.post("/v1/context", json={"scope": "category", "context_id": "dentists", "version": 70,
+                                      "payload": _load_category("dentists"), "delivered_at": "x"})
+    customer = {"customer_id": "c_narrow", "merchant_id": merchant["merchant_id"],
+                "identity": {"name": "Narrow", "language_pref": "en"},
+                "relationship": {"visits_total": 3, "last_visit": "2026-01-01"},
+                "state": "lapsed_soft",
+                "preferences": {"reminder_opt_in": True},
+                "consent": {"opted_in_at": "2025-01-01", "scope": ["recall_reminders"]}}
+    client.post("/v1/context", json={"scope": "customer", "context_id": "c_narrow", "version": 1,
+                                      "payload": customer, "delivered_at": "x"})
+    trigger = {"id": "trg_winback_narrow", "kind": "customer_lapsed_soft", "scope": "customer",
+               "source": "internal", "merchant_id": merchant["merchant_id"],
+               "customer_id": "c_narrow", "payload": {}, "urgency": 3,
+               "suppression_key": "winback:c_narrow", "expires_at": "2027-01-01T00:00:00Z"}
+    client.post("/v1/context", json={"scope": "trigger", "context_id": trigger["id"], "version": 1,
+                                      "payload": trigger, "delivered_at": "x"})
+
+    actions = client.post("/v1/tick", json={"now": "2026-04-26T10:00:00Z",
+                                             "available_triggers": [trigger["id"]]}).json()["actions"]
+    # other merchants' deferred triggers may ride along on this tick; take ours
+    a = next(x for x in actions if x["trigger_id"] == trigger["id"])
+    assert a["send_as"] == "vera", "sent to the customer despite consent not covering promos"
+    assert "Narrow" not in a["body"], "leaked the customer's name into a merchant-facing message"
+    assert "consent" in a["rationale"].lower()
+
+
+def test_runner_up_triggers_are_deferred_not_dropped():
+    """
+    Restraint must not lose messages. When two triggers compete for one
+    merchant, the loser fires on a later tick rather than vanishing — the
+    harness offers each trigger id only once, so dropping it would be permanent.
+    """
+    client.post("/v1/teardown")
+    merchant = next(m for m in _load_merchants() if m["merchant_id"] == "m_003_studio11_salon_hyderabad")
+    client.post("/v1/context", json={"scope": "category", "context_id": "salons", "version": 1,
+                                      "payload": _load_category("salons"), "delivered_at": "x"})
+    client.post("/v1/context", json={"scope": "merchant", "context_id": merchant["merchant_id"],
+                                      "version": 1, "payload": merchant, "delivered_at": "x"})
+    ids = []
+    for t in _load_triggers():
+        if t["merchant_id"] == merchant["merchant_id"]:
+            client.post("/v1/context", json={"scope": "trigger", "context_id": t["id"],
+                                              "version": 1, "payload": t, "delivered_at": "x"})
+            ids.append(t["id"])
+
+    first = client.post("/v1/tick", json={"now": "2026-04-26T10:00:00Z",
+                                           "available_triggers": ids}).json()["actions"]
+    assert len(first) == 1
+
+    # next tick offers NOTHING new — the deferred one should still come through
+    second = client.post("/v1/tick", json={"now": "2026-04-26T10:05:00Z",
+                                            "available_triggers": []}).json()["actions"]
+    assert len(second) == 1, "runner-up was dropped instead of deferred"
+    assert second[0]["trigger_id"] != first[0]["trigger_id"]
+    client.post("/v1/teardown")

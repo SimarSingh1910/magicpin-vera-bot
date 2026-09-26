@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from vera.composer import compose
 from vera.conversation import new_state, respond
+from vera.gating import customer_consent_ok, select_best, template_params
 from vera.store import ContextStore, VALID_SCOPES
 
 app = FastAPI(title="Vera-2 (magicpin AI Challenge bot)")
@@ -37,6 +38,12 @@ merchant_auto_hits: dict[str, dict[str, int]] = defaultdict(dict)
 # score zero messages. Default window covers the 60-minute test window.
 used_suppression_keys: dict[str, tuple[str, float]] = {}
 SUPPRESSION_TTL_SECONDS = float(os.getenv("SUPPRESSION_TTL_SECONDS", "3600"))
+# merchant_id -> trigger_ids that lost this tick's contest for that merchant.
+# Restraint must not mean data loss: only one message per merchant goes out per
+# tick, but the runners-up carry forward and get their turn on a later tick
+# rather than being silently dropped.
+pending_triggers: dict[str, list[str]] = {}
+MAX_PENDING_PER_MERCHANT = 20
 
 TICK_ACTION_CAP = 20
 
@@ -280,27 +287,58 @@ def _category_for(merchant: Optional[dict]) -> Optional[dict]:
 async def tick(body: TickBody):
     actions: list[dict] = []
 
-    for trigger_id in body.available_triggers:
-        if len(actions) >= TICK_ACTION_CAP:
-            break
+    # --- gate first, then pick at most one trigger per merchant -------------
+    # Firing two proactive messages at the same merchant in one tick reads as
+    # spam, so competing triggers are ranked and only the best one survives.
+    carried = [tid for ids in pending_triggers.values() for tid in ids]
+    candidate_ids = list(dict.fromkeys(list(body.available_triggers) + carried))
+    pending_triggers.clear()
 
+    eligible: dict[str, list[dict]] = {}
+    for trigger_id in candidate_ids:
         trigger = store.get("trigger", trigger_id)
         if not trigger:
             continue
-
         suppression_key = trigger.get("suppression_key") or f"{trigger.get('kind')}:{trigger.get('merchant_id')}"
         prior = used_suppression_keys.get(suppression_key)
         if prior and (time.time() - prior[1]) < SUPPRESSION_TTL_SECONDS:
-            continue  # already engaged this trigger in this window — restraint over spam
-
+            continue  # already engaged this trigger in this window
         merchant_id = trigger.get("merchant_id")
-        merchant = store.get("merchant", merchant_id) if merchant_id else None
-        if not merchant:
+        if not merchant_id or not store.get("merchant", merchant_id):
             continue  # can't compose without the merchant we're speaking about/for
+        eligible.setdefault(merchant_id, []).append({**trigger, "id": trigger.get("id", trigger_id)})
 
+    chosen = []
+    for mid, candidates in eligible.items():
+        best, past_window = select_best(candidates, body.now)
+        if not best:
+            continue
+        chosen.append((mid, best, past_window))
+        runners_up = [t["id"] for t in candidates if t.get("id") != best.get("id")]
+        if runners_up:
+            pending_triggers[mid] = runners_up[:MAX_PENDING_PER_MERCHANT]
+    chosen.sort(key=lambda row: row[0])  # deterministic action order
+
+    for merchant_id, trigger, past_window in chosen:
+        if len(actions) >= TICK_ACTION_CAP:
+            break
+
+        trigger_id = trigger.get("id")
+        suppression_key = trigger.get("suppression_key") or f"{trigger.get('kind')}:{merchant_id}"
+        merchant = store.get("merchant", merchant_id)
         category = _category_for(merchant)
+
         customer_id = trigger.get("customer_id")
         customer = store.get("customer", customer_id) if customer_id else None
+        consent_note = ""
+        if customer_id:
+            allowed, reason = customer_consent_ok(trigger, customer)
+            if not allowed:
+                # Never message a customer outside their consent. Tell the
+                # merchant about the opportunity instead — that needs no
+                # customer consent, because it isn't sent to the customer.
+                customer = None
+                consent_note = f" Customer-facing send withheld ({reason}); routed to the merchant instead."
 
         try:
             composed = compose(category, merchant, trigger, customer)
@@ -309,6 +347,8 @@ async def tick(body: TickBody):
 
         if not composed.get("body"):
             continue
+        stale_note = " Trigger is past its stated expires_at but the judge listed it as active." if past_window else ""
+        composed["rationale"] = composed.get("rationale", "") + consent_note + stale_note
 
         conv_suffix = customer_id or trigger_id
         conversation_id = f"conv_{merchant_id}_{conv_suffix}"[:120]
@@ -332,10 +372,8 @@ async def tick(body: TickBody):
             "send_as": composed["send_as"],
             "trigger_id": trigger_id,
             "template_name": f"vera_{trigger.get('kind', 'generic')}_v1",
-            "template_params": [
-                merchant.get("identity", {}).get("name", ""),
-                composed["body"],
-            ],
+            # {{1}} salutation, {{2}} the grounded hook, {{3}} the single CTA
+            "template_params": template_params(composed["body"], merchant, customer),
             "body": composed["body"],
             "cta": composed["cta"],
             "suppression_key": suppression_key,
@@ -394,4 +432,5 @@ async def teardown():
     conversations.clear()
     merchant_auto_hits.clear()
     used_suppression_keys.clear()
+    pending_triggers.clear()
     return {"ok": True}

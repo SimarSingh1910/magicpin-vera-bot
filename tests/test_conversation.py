@@ -71,3 +71,98 @@ def test_ended_conversation_stays_ended():
     respond(state, "Not interested. Stop messaging me.")
     r = respond(state, "Actually wait, I changed my mind")
     assert r["action"] == "end"
+
+
+# --------------------------------------------------------------------------
+# turn-2+ behaviour: answer the question, never repeat, wind down cleanly
+# --------------------------------------------------------------------------
+
+import json
+from pathlib import Path
+
+from vera.composer import compose
+
+_DS = Path(__file__).parent.parent / "dataset"
+_CATS = {json.load(open(f, encoding="utf-8"))["slug"]: json.load(open(f, encoding="utf-8"))
+         for f in (_DS / "categories").glob("*.json")}
+_MERCH = {m["merchant_id"]: m for m in json.load(open(_DS / "merchants_seed.json", encoding="utf-8"))["merchants"]}
+_TRIGS = {t["id"]: t for t in json.load(open(_DS / "triggers_seed.json", encoding="utf-8"))["triggers"]}
+
+
+def _conv(mid="m_001_drmeera_dentist_delhi", tid="trg_001_research_digest_dentists"):
+    m, t = _MERCH[mid], _TRIGS[tid]
+    c = _CATS[m["category_slug"]]
+    first = compose(c, m, t, None)
+    return new_state("c", mid, None, t, m, c, first["body"], {})
+
+
+def test_every_turn_says_something_new():
+    """The old bug: same canned body every turn. Each reply must differ."""
+    st = _conv()
+    bodies = []
+    for msg in ["Interesting, tell me more", "How much would that cost me?",
+                "Whats the source?", "And how long does it take?"]:
+        r = respond(st, msg)
+        if r.get("body"):
+            bodies.append(r["body"])
+    assert len(bodies) == len(set(bodies)), f"repeated a body: {bodies}"
+    assert not any("following up again" in b for b in bodies), "fell back to the repeat suffix"
+
+
+def test_source_question_is_answered_with_the_real_citation():
+    st = _conv()
+    r = respond(st, "Whats the source for that?")
+    assert "JIDA Oct 2026, p.14" in r["body"], r["body"]
+
+
+def test_price_question_answers_from_real_offers_only():
+    st = _conv()
+    r = respond(st, "How much will this cost me?")
+    # the only price fact this merchant has is their live offer
+    assert "₹299" in r["body"], r["body"]
+
+
+def test_unanswerable_question_says_so_instead_of_inventing():
+    """A merchant with no price data anywhere must not get a made-up figure."""
+    bare = {"merchant_id": "m_bare", "category_slug": "dentists",
+            "identity": {"name": "Bare Clinic", "owner_first_name": "Asha", "languages": ["en"]},
+            "performance": {}, "offers": [], "signals": [], "customer_aggregate": {}}
+    trigger = {"id": "t", "kind": "curious_ask_due", "scope": "merchant", "source": "internal",
+               "merchant_id": "m_bare", "payload": {}, "urgency": 1, "suppression_key": "k"}
+    st = new_state("c", "m_bare", None, trigger, bare, {"slug": "dentists"}, "opener", {})
+    r = respond(st, "How much does it cost?")
+    body = r.get("body", "")
+    assert "₹" not in body, f"invented a price: {body}"
+    assert "don't have" in body.lower() or r["action"] == "end", body
+
+
+def test_commitment_phrasings_all_route_to_action():
+    for phrasing in ["Fine, do it", "go for it", "please draft it", "theek hai karo", "sounds good"]:
+        st = _conv()
+        r = respond(st, phrasing)
+        assert r["action"] == "send", phrasing
+        low = r["body"].lower()
+        assert any(w in low for w in ("starting", "done", "shuru")), f"{phrasing} -> {r['body']}"
+        assert "?" not in r["body"], f"re-qualified after commitment: {r['body']}"
+
+
+def test_busy_merchant_gets_backed_off_not_pushed():
+    st = _conv()
+    r = respond(st, "abhi busy hoon, baad mein")
+    assert r["action"] == "wait" and r["wait_seconds"] >= 3600
+
+
+def test_conversation_winds_down_instead_of_nudging_forever():
+    st = _conv()
+    actions = [respond(st, "hmm ok")["action"] for _ in range(6)]
+    assert "end" in actions, f"never wound down: {actions}"
+
+
+def test_language_is_mirrored_per_turn():
+    """An English-only merchant writing Hinglish gets Hinglish back."""
+    m = dict(_MERCH["m_001_drmeera_dentist_delhi"])
+    m["identity"] = dict(m["identity"], languages=["en"])
+    t = _TRIGS["trg_001_research_digest_dentists"]
+    st = new_state("c", m["merchant_id"], None, t, m, _CATS["dentists"], "opener", {})
+    r = respond(st, "iska source kya hai?")
+    assert any(w in r["body"] for w in ("kar dun", "Aage badhun", "karke")), r["body"]
