@@ -5,6 +5,7 @@ Run: uvicorn bot:app --host 0.0.0.0 --port 8080   (bot.py at repo root re-export
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections import defaultdict
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from vera.composer import compose
@@ -57,12 +58,136 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# GET / — not part of the judge contract. The submission URL gets opened in a
-# browser by humans, and a bare 404 there reads as "the bot is down", so this
-# returns a short service card instead.
+# Browser-facing extras — NOT part of the judge contract (§2 defines /v1/* only).
+# The submission URL gets opened by a human, so "/" serves a small console that
+# drives the real endpoints, and "/info" keeps the machine-readable card.
+# Everything here is namespaced under /demo so it can never collide with /v1.
 # ---------------------------------------------------------------------------
-@app.get("/")
-async def root():
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+DATASET_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def console():
+    index = os.path.join(STATIC_DIR, "index.html")
+    if not os.path.exists(index):
+        return HTMLResponse("<h1>Vera-2</h1><p>Console not bundled. See <a href='/info'>/info</a>.</p>")
+    with open(index, encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.post("/demo/seed")
+async def demo_seed():
+    """
+    Load the bundled seed dataset so an evaluator has something to drive.
+
+    Pushes at version 1 through the same store the judge writes to — so if the
+    judge later pushes its own version 1, that push is correctly rejected as
+    stale. Hit "Reset" (POST /v1/teardown) before a real judged run.
+    """
+    if not os.path.isdir(DATASET_DIR):
+        return JSONResponse(status_code=404, content={"ok": False, "reason": "dataset not bundled"})
+
+    loaded = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
+    cat_dir = os.path.join(DATASET_DIR, "categories")
+    if os.path.isdir(cat_dir):
+        for fname in os.listdir(cat_dir):
+            if not fname.endswith(".json"):
+                continue
+            with open(os.path.join(cat_dir, fname), encoding="utf-8") as f:
+                payload = json.load(f)
+            if store.push("category", payload.get("slug", fname[:-5]), 1, payload)[0]:
+                loaded["category"] += 1
+
+    for fname, scope, container, key in (
+        ("merchants_seed.json", "merchant", "merchants", "merchant_id"),
+        ("customers_seed.json", "customer", "customers", "customer_id"),
+        ("triggers_seed.json", "trigger", "triggers", "id"),
+    ):
+        path = os.path.join(DATASET_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for item in (json.load(f).get(container) or []):
+                if key in item and store.push(scope, item[key], 1, item)[0]:
+                    loaded[scope] += 1
+
+    return {"ok": True, "loaded": loaded, "contexts_loaded": store.counts()}
+
+
+@app.get("/demo/catalog")
+async def demo_catalog():
+    """Merchants and triggers currently in the store, for the console's pickers."""
+    merchants, triggers = [], []
+    for (scope, cid), entry in store.items():
+        payload = entry["payload"]
+        if scope == "merchant":
+            merchants.append({
+                "id": cid,
+                "name": payload.get("identity", {}).get("name", cid),
+                "category": payload.get("category_slug", ""),
+            })
+        elif scope == "trigger":
+            triggers.append({
+                "id": cid,
+                "kind": payload.get("kind", ""),
+                "merchant_id": payload.get("merchant_id", ""),
+                "customer_id": payload.get("customer_id"),
+                "urgency": payload.get("urgency"),
+            })
+    merchants.sort(key=lambda m: m["id"])
+    triggers.sort(key=lambda t: t["id"])
+    return {"merchants": merchants, "triggers": triggers}
+
+
+class DemoComposeBody(BaseModel):
+    trigger_id: str
+    conversation_id: Optional[str] = None
+
+
+@app.post("/demo/compose")
+async def demo_compose(body: DemoComposeBody):
+    """
+    Compose a preview for one trigger, repeatably.
+
+    Deliberately NOT /v1/tick: tick dedupes on suppression_key, so a second
+    click on the same trigger correctly returns nothing. That's right for the
+    judge and useless for a human poking at it, so this calls the composer
+    directly and touches no conversation state.
+    """
+    trigger = store.get("trigger", body.trigger_id)
+    if not trigger:
+        return JSONResponse(status_code=404, content={"error": "unknown trigger_id"})
+    merchant = store.get("merchant", trigger.get("merchant_id"))
+    if not merchant:
+        return JSONResponse(status_code=404, content={"error": "merchant for this trigger isn't loaded"})
+    category = _category_for(merchant)
+    customer_id = trigger.get("customer_id")
+    customer = store.get("customer", customer_id) if customer_id else None
+
+    composed = compose(category, merchant, trigger, customer)
+
+    # register real conversation state so the console's reply flow exercises the
+    # same code path /v1/reply uses after a real /v1/tick send
+    if body.conversation_id:
+        conversations[body.conversation_id] = new_state(
+            conversation_id=body.conversation_id,
+            merchant_id=trigger.get("merchant_id"),
+            customer_id=customer_id,
+            trigger=trigger, merchant=merchant, category=category,
+            first_body=composed["body"],
+            auto_reply_hits=merchant_auto_hits[trigger.get("merchant_id")],
+        )
+
+    composed["merchant_name"] = merchant.get("identity", {}).get("name", "")
+    composed["merchant_id"] = trigger.get("merchant_id")
+    composed["trigger_kind"] = trigger.get("kind", "")
+    composed["customer_name"] = (customer or {}).get("identity", {}).get("name")
+    return composed
+
+
+@app.get("/info")
+async def info():
     return {
         "service": "Vera-2 — magicpin AI Challenge bot",
         "team": METADATA["team_name"],

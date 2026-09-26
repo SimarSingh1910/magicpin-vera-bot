@@ -37,6 +37,10 @@ class ContextStore:
         entry = self._data.get((scope, context_id))
         return entry["version"] if entry else None
 
+    def items(self):
+        """(scope, context_id) -> {version, payload} pairs, for the demo console."""
+        return list(self._data.items())
+
     def counts(self) -> dict[str, int]:
         out = {s: 0 for s in VALID_SCOPES}
         for (scope, _cid) in self._data.keys():

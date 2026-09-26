@@ -7,6 +7,12 @@ and a conversation state machine for multi-turn replies.
 **Live bot**: `<paste your deployed URL here>` · **Endpoints**: `/v1/healthz` `/v1/metadata`
 `/v1/context` `/v1/tick` `/v1/reply` (+ optional `/v1/teardown`)
 
+**Opening the URL in a browser gives an evaluator console** — load the sample dataset, pick any
+trigger to see what Vera would send, then reply as the merchant (engaged / commits / auto-reply /
+off-topic / hard no) and watch it route. It drives the real `/v1/*` endpoints, so nothing there is
+mocked. `/docs` has the interactive API explorer; `/info` is the machine-readable card.
+Console-only helpers live under `/demo/*` and are outside the judged contract.
+
 ## Run
 
 ```bash
@@ -27,7 +33,8 @@ bot.py                   entrypoint (re-exports vera.server:app)
 vera/composer.py         pure compose(category, merchant, trigger, customer) -> dict
 vera/conversation.py     /v1/reply state machine
 vera/store.py            idempotent (scope, context_id, version) store
-vera/server.py           FastAPI wiring
+vera/server.py           FastAPI wiring (+ /demo/* console backend)
+vera/static/index.html   evaluator console served at /
 conversation_handlers.py optional §7.4 contract
 docs/EVALUATION.md       measurements, defects found + fixed
 ```

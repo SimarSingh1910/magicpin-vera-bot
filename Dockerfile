@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py conversation_handlers.py ./
 COPY vera/ ./vera/
+# the evaluator console's "Load sample data" button reads these at runtime
+COPY dataset/ ./dataset/
 
 # Hosts inject $PORT; default to 8080 for local runs.
 ENV PORT=8080
