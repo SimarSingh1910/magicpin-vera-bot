@@ -18,7 +18,7 @@ Console-only helpers live under `/demo/*` and are outside the judged contract.
 ```bash
 pip install -r requirements.txt
 python bot.py                  # honors $PORT (default 8080); or: uvicorn bot:app --port 8080
-pytest tests/ -q               # 52 tests, no server/network needed
+pytest tests/ -q               # 55 tests, no server/network needed  (pip install -r requirements-dev.txt)
 python submission_gen.py       # rebuilds dataset/expanded/ + writes submission.jsonl
 ```
 
