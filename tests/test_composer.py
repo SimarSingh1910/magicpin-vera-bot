@@ -223,3 +223,35 @@ def test_placeholder_event_payload_does_not_dredge_up_an_out_of_season_beat():
     body = compose(CATEGORIES["gyms"], merchant, trigger, None)["body"]
 
     assert "Jan" not in body and "resolution surge" not in body, f"cited an out-of-season beat: {body}"
+
+
+def test_customer_scoped_trigger_without_customer_context_talks_to_the_merchant():
+    """
+    The judge harness pushes categories, merchants and triggers — never
+    customers. A customer-scoped trigger must then become a merchant-facing
+    opportunity nudge, not a message addressed to the merchant as if they were
+    the patient.
+    """
+    merchant = MERCHANTS["m_001_drmeera_dentist_delhi"]
+    trigger = TRIGGERS["trg_003_recall_due_priya"]
+
+    result = compose(CATEGORIES["dentists"], merchant, trigger, None)  # no customer
+
+    assert result["send_as"] == "vera", "with no customer context this must be merchant-facing"
+    body = result["body"]
+    assert "your last visit" not in body.lower(), f"addressed the dentist as the patient: {body}"
+    assert "patient" in body.lower() or "customer" in body.lower()
+    assert "Wed 5 Nov, 6pm" in body, "real slot data from the payload should still be used"
+    # and it must not name or invent a customer we were never given
+    assert "Priya" not in body
+
+
+def test_customer_scoped_trigger_with_customer_context_still_writes_to_the_customer():
+    merchant = MERCHANTS["m_001_drmeera_dentist_delhi"]
+    trigger = TRIGGERS["trg_003_recall_due_priya"]
+    customer = CUSTOMERS["c_001_priya_for_m001"]
+
+    result = compose(CATEGORIES["dentists"], merchant, trigger, customer)
+
+    assert result["send_as"] == "merchant_on_behalf"
+    assert "Priya" in result["body"]

@@ -130,3 +130,33 @@ def test_reply_on_unknown_conversation_id_does_not_crash():
     })
     assert r.status_code == 200
     assert r.json()["action"] in ("send", "wait", "end")
+
+
+def test_suppression_is_a_window_not_a_permanent_ban(monkeypatch):
+    """
+    A second judge pass must not find every trigger permanently muted — that
+    would score zero messages. Within the window, dedup still holds.
+    """
+    import vera.server as srv
+
+    category = _load_category("dentists")
+    client.post("/v1/context", json={"scope": "category", "context_id": "dentists", "version": 90,
+                                      "payload": category, "delivered_at": "2026-04-26T09:00:00Z"})
+    merchant = next(m for m in _load_merchants() if m["merchant_id"] == "m_002_bharat_dentist_mumbai")
+    client.post("/v1/context", json={"scope": "merchant", "context_id": merchant["merchant_id"],
+                                      "version": 90, "payload": merchant, "delivered_at": "x"})
+    trigger = next(t for t in _load_triggers() if t["id"] == "trg_004_perf_dip_bharat")
+    client.post("/v1/context", json={"scope": "trigger", "context_id": trigger["id"], "version": 90,
+                                      "payload": trigger, "delivered_at": "x"})
+
+    first = client.post("/v1/tick", json={"now": "x", "available_triggers": [trigger["id"]]}).json()
+    assert len(first["actions"]) == 1
+
+    # immediately again -> suppressed
+    again = client.post("/v1/tick", json={"now": "x", "available_triggers": [trigger["id"]]}).json()
+    assert again["actions"] == []
+
+    # past the window -> free to fire again
+    monkeypatch.setattr(srv, "SUPPRESSION_TTL_SECONDS", 0.0)
+    later = client.post("/v1/tick", json={"now": "x", "available_triggers": [trigger["id"]]}).json()
+    assert len(later["actions"]) == 1

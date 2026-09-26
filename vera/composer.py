@@ -301,6 +301,8 @@ ASK_HI_EN = {
     "Want me to check if it matches anything you're carrying?":
         "Check kar lun ki aapke stock mein yeh batch hai ya nahi?",
     "Ready for me to draft the next version?": "Agla version draft kar dun?",
+    "Want me to draft the message you can send them?":
+        "Unke liye message draft kar dun jo aap bhej saken?",
     "Want me to take a closer look and suggest one thing to fix?":
         "Thoda detail mein dekh ke ek cheez suggest karun jo fix ho sake?",
     # customer-facing (sent as the merchant)
@@ -824,6 +826,64 @@ def h_trial_followup(category, merchant, trigger, customer):
     return facts, "binary_yes_no", ask, ["effort_externalization"], "trial_followup", ""
 
 
+def h_customer_opportunity(category, merchant, trigger, customer=None):
+    """
+    Customer-scoped trigger fired, but we hold no CustomerContext for it.
+
+    This is the normal case under the judge harness, which pushes categories,
+    merchants and triggers but never customers. Without the customer we cannot
+    write *to* the customer — addressing the merchant with "your cleaning is
+    due" is both wrong and embarrassing. So we tell the merchant about the
+    opportunity instead, using only the trigger payload, and offer to draft the
+    outreach. Merchant-facing, so send_as stays "vera".
+    """
+    kind = trigger.get("kind", "")
+    p = trigger.get("payload") or {}
+    facts = []
+
+    if kind == "recall_due":
+        service = humanize(p.get("service_due")) or "a recall visit"
+        due = p.get("due_date")
+        facts.append(f"One of your patients is due for {service}" + (f" on {due}." if due else "."))
+        labels = [s.get("label") for s in (p.get("available_slots") or []) if s.get("label")]
+        if labels:
+            facts.append("You have " + " and ".join(labels) + " open.")
+    elif kind in ("customer_lapsed_hard", "customer_lapsed_soft"):
+        days = p.get("days_since_last_visit")
+        facts.append(f"A customer of yours hasn't been in for {days} days."
+                     if days else "One of your regulars has gone quiet.")
+        if p.get("previous_focus"):
+            facts.append(f"They were working on {humanize(p['previous_focus'])}.")
+        if p.get("previous_membership_months"):
+            facts.append(f"They held a {p['previous_membership_months']}-month membership before that.")
+    elif kind == "chronic_refill_due":
+        molecules = p.get("molecule_list")
+        facts.append(f"A regular customer's refill ({', '.join(molecules)}) is due."
+                     if molecules else "A regular customer's refill is due.")
+        if p.get("stock_runs_out_iso"):
+            facts.append(f"Their stock runs out around {p['stock_runs_out_iso'].split('T')[0]}.")
+    elif kind == "appointment_tomorrow":
+        facts.append("You have an appointment booked for tomorrow that hasn't been confirmed.")
+    elif kind == "trial_followup":
+        trial_date = p.get("trial_date")
+        facts.append(f"Your trial attendee from {trial_date} hasn't booked a next session."
+                     if trial_date else "A trial attendee hasn't booked again.")
+        if p.get("next_session_options"):
+            facts.append("You have open slots to offer them.")
+    elif kind == "wedding_package_followup":
+        days = p.get("days_to_wedding")
+        facts.append(f"A bridal client's date is {days} days out and the package isn't locked."
+                     if days else "A bridal client hasn't locked their package.")
+        if p.get("trial_completed"):
+            facts.append("Their trial is already done.")
+    else:
+        facts.append("One of your customers has an open follow-up.")
+
+    ask = "Want me to draft the message you can send them?"
+    return facts, "binary_yes_no", ask, ["effort_externalization", "specificity"], \
+        f"customer_opportunity:{kind}", ""
+
+
 def h_generic(category, merchant, trigger, customer):
     """Fallback for any trigger kind without a dedicated handler — still fact-anchored."""
     signals = signal_texts(merchant)
@@ -884,7 +944,12 @@ HANDLERS = {
 
 def compose(category: Optional[dict], merchant: dict, trigger: dict, customer: Optional[dict] = None) -> dict:
     kind = trigger.get("kind", "generic")
-    handler = HANDLERS.get(kind, h_generic)
+    # A customer-scoped trigger with no CustomerContext can't be written *to*
+    # the customer — tell the merchant about the opportunity instead.
+    if customer is None and (trigger.get("customer_id") or trigger.get("scope") == "customer"):
+        handler = h_customer_opportunity
+    else:
+        handler = HANDLERS.get(kind, h_generic)
     facts, cta, ask, levers, anchor, citation = handler(category or {}, merchant, trigger, customer)
 
     mix = voice_mix(merchant, customer)

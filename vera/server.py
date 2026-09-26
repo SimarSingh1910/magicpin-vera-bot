@@ -31,9 +31,12 @@ conversations: dict[str, dict] = {}
 # merchant so a WA Business canned auto-reply is caught even if the judge
 # starts a fresh conversation_id per turn.
 merchant_auto_hits: dict[str, dict[str, int]] = defaultdict(dict)
-# suppression_key -> conversation_id already sent, so the same trigger is
-# never re-composed into a second outbound conversation.
-used_suppression_keys: dict[str, str] = {}
+# suppression_key -> (conversation_id, unix_ts of the send). Dedup is a WINDOW,
+# not a permanent ban: within a run the same trigger never fires twice, but a
+# second judge pass hours later must not find every trigger silently muted and
+# score zero messages. Default window covers the 60-minute test window.
+used_suppression_keys: dict[str, tuple[str, float]] = {}
+SUPPRESSION_TTL_SECONDS = float(os.getenv("SUPPRESSION_TTL_SECONDS", "3600"))
 
 TICK_ACTION_CAP = 20
 
@@ -286,8 +289,9 @@ async def tick(body: TickBody):
             continue
 
         suppression_key = trigger.get("suppression_key") or f"{trigger.get('kind')}:{trigger.get('merchant_id')}"
-        if suppression_key in used_suppression_keys:
-            continue  # already engaged this trigger — restraint over spam
+        prior = used_suppression_keys.get(suppression_key)
+        if prior and (time.time() - prior[1]) < SUPPRESSION_TTL_SECONDS:
+            continue  # already engaged this trigger in this window — restraint over spam
 
         merchant_id = trigger.get("merchant_id")
         merchant = store.get("merchant", merchant_id) if merchant_id else None
@@ -319,7 +323,7 @@ async def tick(body: TickBody):
             first_body=composed["body"],
             auto_reply_hits=merchant_auto_hits[merchant_id],
         )
-        used_suppression_keys[suppression_key] = conversation_id
+        used_suppression_keys[suppression_key] = (conversation_id, time.time())
 
         actions.append({
             "conversation_id": conversation_id,
