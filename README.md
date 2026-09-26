@@ -22,6 +22,12 @@ pytest tests/ -q               # 55 tests, no server/network needed  (pip instal
 python submission_gen.py       # rebuilds dataset/expanded/ + writes submission.jsonl
 ```
 
+**Staying warm.** Render's free tier spins down after ~15 min idle and cold-starts in 50s+,
+against the harness's 5s healthz timeout and 3-strike disqualification. The app pings its own
+public URL every 10 min (`RENDER_EXTERNAL_URL`, or `PUBLIC_URL` locally) to hold the instance
+open; `/info` reports ping/failure counts. The loop never starts without one of those vars set,
+so tests and local runs are unaffected.
+
 Deploy: `Dockerfile`, `Procfile`, and `render.yaml` included. Set `TEAM_NAME`, `TEAM_MEMBERS`,
 `CONTACT_EMAIL` as env vars — `/v1/metadata` reads them. Run **one worker**: context and
 conversation state live in process memory, so two workers would each hold half the pushes.

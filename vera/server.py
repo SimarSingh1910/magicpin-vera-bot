@@ -5,9 +5,11 @@ Run: uvicorn bot:app --host 0.0.0.0 --port 8080   (bot.py at repo root re-export
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -21,7 +23,54 @@ from vera.conversation import new_state, respond
 from vera.gating import customer_consent_ok, select_best, template_params
 from vera.store import ContextStore, VALID_SCOPES
 
-app = FastAPI(title="Vera-2 (magicpin AI Challenge bot)")
+# ---------------------------------------------------------------------------
+# Keep-warm
+#
+# Render's free tier spins an instance down after ~15 minutes without inbound
+# traffic, and a cold start takes 50s+. The judge's healthz timeout is 5s and
+# three consecutive failures is a disqualification, so a spun-down instance
+# doesn't score badly — it scores nothing. This pings our own public URL on a
+# timer, which counts as inbound traffic and holds the instance open. Render
+# publishes the URL as RENDER_EXTERNAL_URL; with neither that nor PUBLIC_URL
+# set (local runs, tests) the loop never starts.
+#
+# One always-on free service costs ~720 instance-hours/month against Render's
+# 750-hour allowance, so this fits — but it is the *only* service that can.
+# ---------------------------------------------------------------------------
+KEEPALIVE_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
+KEEPALIVE_INTERVAL = float(os.getenv("KEEPALIVE_INTERVAL_SECONDS", "600"))
+keepalive_stats = {"pings": 0, "failures": 0, "last_status": None}
+
+
+def _ping_once() -> None:
+    import urllib.request
+    req = urllib.request.Request(f"{KEEPALIVE_URL}/v1/healthz", headers={"User-Agent": "vera-keepalive"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        keepalive_stats["last_status"] = resp.status
+
+
+async def _keepalive_loop() -> None:
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        try:
+            # urllib is blocking; keep it off the event loop so it can never
+            # delay a judge request
+            await asyncio.get_running_loop().run_in_executor(None, _ping_once)
+            keepalive_stats["pings"] += 1
+        except Exception as exc:  # a failed self-ping must never kill the loop
+            keepalive_stats["failures"] += 1
+            keepalive_stats["last_status"] = repr(exc)[:120]
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(_keepalive_loop()) if KEEPALIVE_URL else None
+    yield
+    if task:
+        task.cancel()
+
+
+app = FastAPI(title="Vera-2 (magicpin AI Challenge bot)", lifespan=lifespan)
 
 START = time.time()
 store = ContextStore()
@@ -213,6 +262,11 @@ async def info():
             "POST /v1/teardown": "wipe all state (optional)",
         },
         "interactive_docs": "/docs",
+        "keepalive": {
+            "enabled": bool(KEEPALIVE_URL),
+            "interval_seconds": KEEPALIVE_INTERVAL,
+            **keepalive_stats,
+        },
     }
 
 
