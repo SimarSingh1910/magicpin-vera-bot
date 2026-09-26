@@ -18,7 +18,7 @@ Console-only helpers live under `/demo/*` and are outside the judged contract.
 ```bash
 pip install -r requirements.txt
 python bot.py                  # honors $PORT (default 8080); or: uvicorn bot:app --port 8080
-pytest tests/ -q               # 55 tests, no server/network needed  (pip install -r requirements-dev.txt)
+pytest tests/ -q               # 77 tests, no server/network needed  (pip install -r requirements-dev.txt)
 python submission_gen.py       # rebuilds dataset/expanded/ + writes submission.jsonl
 ```
 
@@ -66,10 +66,25 @@ table entry stays English rather than being machine-translated.
 passes through `humanize()`; signals appear only if they have merchant-readable phrasing, so an
 unrecognized signal is dropped rather than leaked.
 
-**Replies** check in order: hostile → opt-out → auto-reply (regex *and* verbatim-repeat, counted
+**Replies** answer what was asked. `vera/dialogue.py` builds a pool of the real facts a
+conversation can still spend (digest summary, source citation, payload dates and slots, live
+offers, the merchant's numbers vs peers) and classifies each turn — price, timing, proof,
+detail, pivot, defer, commit — answering from that pool, keyword-matched to the question. Each
+fact is spent once so no turn repeats; an unanswerable question says so rather than inventing a
+figure; language is mirrored per turn; the thread winds down after three unproductive turns.
+Routing checks in order: hostile → opt-out → auto-reply (regex *and* verbatim-repeat, counted
 per **merchant_id** not per conversation, since the judge opens a fresh `conversation_id` each
 turn) → explicit commitment ("let's do it" → act, never re-qualify) → off-topic curveball →
 otherwise acknowledge and advance. Bodies are never repeated verbatim.
+
+**Send-time gates** (`vera/gating.py`). One proactive message per merchant per tick, with
+runners-up deferred to a pending queue rather than dropped. `expires_at` is a strong preference,
+not a hard drop — live triggers always win, but when everything on offer is stale we still send
+the best of it and say so, because 21 of the 25 shipped triggers are past their authoring-window
+dates while the harness sends wall-clock `now`. Customer consent is checked before any
+customer-facing send, matching on scope names *and* keywords since consent vocabulary varies per
+merchant and the judge injects customers with unseen scopes; outside scope routes to the
+merchant-facing opportunity nudge instead.
 
 **Idempotency.** `(scope, context_id)` → `{version, payload}`; `version <= current` returns
 `409 stale_version`, higher replaces atomically. `/v1/tick` also dedupes on `suppression_key`,
