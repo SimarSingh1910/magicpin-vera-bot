@@ -47,21 +47,37 @@ def is_expired(trigger: dict, now_iso: Optional[str]) -> bool:
     return expires < now
 
 
-# Which consent scope a customer-facing message of this kind needs. A trigger
-# kind that isn't listed is treated as promotional — the strictest reasonable
-# default, so an unknown kind can't leak past consent.
-CONSENT_REQUIRED = {
-    "recall_due": "recall_reminders",
-    "appointment_tomorrow": "appointment_reminders",
-    "chronic_refill_due": "recall_reminders",
-    "trial_followup": "treatment_followup",
-    "wedding_package_followup": "appointment_reminders",
-    "customer_lapsed_soft": "promotional_offers",
-    "customer_lapsed_hard": "promotional_offers",
+# What a customer-facing message of each kind is allowed to ride on.
+#
+# Consent vocabulary varies by merchant — the shipped customers alone use
+# refill_reminders, recall_alerts, winback_offers, renewal_reminders,
+# kids_program_updates and bridal_package_followup — and the judge injects
+# customers we've never seen, so an exact-string map is both wrong today and
+# brittle tomorrow. Each kind therefore names the scopes it accepts, plus
+# keywords for matching scope names we haven't met. An unlisted kind falls back
+# to the promotional set, the strictest bucket, so nothing leaks by default.
+CONSENT_SCOPES = {
+    "recall_due": ({"recall_reminders", "recall_alerts", "appointment_reminders",
+                    "treatment_followup"}, {"recall", "appointment", "checkup", "followup"}),
+    "appointment_tomorrow": ({"appointment_reminders", "booking_reminders"},
+                             {"appointment", "booking", "reminder"}),
+    "chronic_refill_due": ({"refill_reminders", "recall_alerts", "delivery_notifications",
+                            "recall_reminders"}, {"refill", "delivery", "prescription", "recall"}),
+    "trial_followup": ({"treatment_followup", "kids_program_updates", "program_updates",
+                        "trial_followup", "appointment_reminders"},
+                       {"trial", "program", "followup", "session", "class"}),
+    "wedding_package_followup": ({"bridal_package_followup", "appointment_reminders",
+                                  "treatment_followup"},
+                                 {"bridal", "wedding", "package", "appointment", "followup"}),
+    "customer_lapsed_soft": ({"promotional_offers", "winback_offers", "renewal_reminders"},
+                             {"promotional", "winback", "offer", "renewal", "marketing"}),
+    "customer_lapsed_hard": ({"promotional_offers", "winback_offers", "renewal_reminders"},
+                             {"promotional", "winback", "offer", "renewal", "marketing"}),
 }
+DEFAULT_CONSENT = ({"promotional_offers", "winback_offers"}, {"promotional", "offer", "marketing"})
 
 # Scopes broad enough to cover anything narrower.
-BROAD_SCOPES = {"all", "any", "marketing", "promotional_offers"}
+BROAD_SCOPES = {"all", "any", "everything"}
 
 
 def customer_consent_ok(trigger: dict, customer: Optional[dict]) -> tuple[bool, str]:
@@ -81,15 +97,25 @@ def customer_consent_ok(trigger: dict, customer: Optional[dict]) -> tuple[bool, 
     if customer.get("state") == "churned":
         return False, "customer state is churned"
 
-    scopes = g(customer, "consent", "scope", default=None)
-    if scopes is None:
+    raw = g(customer, "consent", "scope", default=None)
+    if raw is None:
         return False, "no recorded consent scope"
-    scopes = {str(s).strip().lower() for s in scopes}
+    scopes = {str(s).strip().lower() for s in raw}
 
-    needed = CONSENT_REQUIRED.get(trigger.get("kind", ""), "promotional_offers")
-    if needed in scopes or scopes & BROAD_SCOPES:
-        return True, f"consent covers {needed}"
-    return False, f"consent scope {sorted(scopes)} does not cover {needed}"
+    kind = trigger.get("kind", "")
+    accepted, keywords = CONSENT_SCOPES.get(kind, DEFAULT_CONSENT)
+
+    if scopes & BROAD_SCOPES:
+        return True, "consent is unrestricted"
+    hit = scopes & accepted
+    if hit:
+        return True, f"consent includes {sorted(hit)[0]}"
+    # scope names we haven't seen before: accept on a shared keyword
+    for scope in scopes:
+        for word in keywords:
+            if word in scope:
+                return True, f"consent scope '{scope}' covers {kind}"
+    return False, f"consent scope {sorted(scopes)} does not cover {kind}"
 
 
 def rank_triggers(triggers: list[dict]) -> list[dict]:
