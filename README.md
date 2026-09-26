@@ -4,7 +4,7 @@ Rule-based (not LLM-backed) implementation of the Vera contract: a FastAPI serve
 5 endpoints from `challenge-testing-brief.md`, a pure `compose()` over the 4-context framework,
 and a conversation state machine for multi-turn replies.
 
-**Live bot**: `<paste your deployed URL here>` · **Endpoints**: `/v1/healthz` `/v1/metadata`
+**Live bot**: https://vera-2-bot.onrender.com · **Endpoints**: `/v1/healthz` `/v1/metadata`
 `/v1/context` `/v1/tick` `/v1/reply` (+ optional `/v1/teardown`)
 
 **Opening the URL in a browser gives an evaluator console** — load the sample dataset, pick any
