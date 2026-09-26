@@ -57,6 +57,31 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# GET / — not part of the judge contract. The submission URL gets opened in a
+# browser by humans, and a bare 404 there reads as "the bot is down", so this
+# returns a short service card instead.
+# ---------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {
+        "service": "Vera-2 — magicpin AI Challenge bot",
+        "team": METADATA["team_name"],
+        "status": "ok",
+        "uptime_seconds": int(time.time() - START),
+        "contexts_loaded": store.counts(),
+        "endpoints": {
+            "GET  /v1/healthz": "liveness + context counts",
+            "GET  /v1/metadata": "bot identity",
+            "POST /v1/context": "receive a context push (idempotent on version)",
+            "POST /v1/tick": "periodic wake-up; returns proactive actions",
+            "POST /v1/reply": "merchant/customer reply -> send | wait | end",
+            "POST /v1/teardown": "wipe all state (optional)",
+        },
+        "interactive_docs": "/docs",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 2.4 GET /v1/healthz
 # ---------------------------------------------------------------------------
 @app.get("/v1/healthz")
